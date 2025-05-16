@@ -1,52 +1,69 @@
-const express = require('express');
-const multer = require('multer');
-const vision = require('@google-cloud/vision');
+
+const express = require("express");
+const multer = require("multer");
+const cors = require("cors");
+const vision = require("@google-cloud/vision");
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
-const PORT = process.env.PORT || 10000;
-
-// Google Vision Client
 const client = new vision.ImageAnnotatorClient();
 
+app.use(cors());
 app.use(express.json());
 
-app.post('/analyze', upload.single('file'), async (req, res) => {
+app.post("/analyze", upload.single("file"), async (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: "Keine Datei empfangen." });
+
     const [result] = await client.documentTextDetection({ image: { content: req.file.buffer } });
-    const text = result.fullTextAnnotation.text;
+    const text = result.fullTextAnnotation?.text || "";
 
-    const material = (text.match(/1\.\d{4}/) || [])[0] || 'k.A.';
-    const nummer = (text.match(/(A\d{6,})/) || [])[0] || 'k.A.';
-    const name = (text.match(/\b[A-Z]{2,}[\w\s\-\/]{5,}/) || [])[0] || 'k.A.';
+    if (!text) return res.status(400).json({ error: "Kein Text erkannt." });
 
-    const maße = (text.match(/\b(\d{2,4})\s*x\s*(\d{2,4})\s*x\s*(\d{1,4})\b/i) || []).slice(1, 4);
-    const [L, B, H] = maße.map(m => parseFloat(m)).filter(Boolean);
-    const volumen = L && B && H ? (L / 1000) * (B / 1000) * (H / 1000) : 0;
+    const extract = (regex) => (text.match(regex) || [])[1] || "nicht erkannt";
 
-    const dichte = material === '1.4301' ? 7.9 : material === '1.2024' ? 2.7 : 1.0;
-    const gewicht = volumen * dichte;
+    const teilname = extract(/Benennung\s*[:=]?\s*(.+)/i) || extract(/Konturplatte\s*([\d\sxX\.,]+)/i);
+    const zeichnungsnummer = extract(/(A\d{6,})/) || extract(/(7\d{6,})/);
+    const materialRaw = extract(/1\.\d{4}|3\.\d{4}|AlMg\w*|S235|C45|1\.4301/i);
+    let material = "unbekannt", dichte = 7.85;
 
-    const laufzeit = gewicht > 0 ? Math.max(5, gewicht * 2) : 0;
-    const materialkosten = gewicht * 2;  // 2 €/kg
-    const preis1 = materialkosten + laufzeit * 1.5 + 60;
-    const preis10 = preis1 * 0.9;
-    const preis100 = preis1 * 0.75;
+    if (/1\.4301|edelstahl/i.test(materialRaw)) { material = "Edelstahl"; dichte = 7.9; }
+    else if (/1\.2767|werkzeugstahl/i.test(materialRaw)) { material = "Werkzeugstahl"; dichte = 7.85; }
+    else if (/3\.4365|almg|aluminium/i.test(materialRaw)) { material = "Aluminium"; dichte = 2.7; }
+
+    const masseMatch = text.match(/(\d{2,4})\s?[xX*]\s?(\d{2,4})\s?[xX*]\s?(\d{1,4}[\.,]\d{1,2})/);
+    let masse = "nicht erkannt", gewicht = "k.A.", preis1 = "-", preis10 = "-", preis100 = "-";
+
+    if (masseMatch) {
+      const [l, b, h] = masseMatch.slice(1, 4).map(v => parseFloat(v.replace(",", ".")));
+      masse = `${l} x ${b} x ${h} mm`;
+      const volume_cm3 = (l * b * h) / 1000;
+      const weight_kg = (volume_cm3 * dichte) / 1000;
+      gewicht = weight_kg.toFixed(3) + " kg";
+
+      const laufzeit = Math.max(5, weight_kg * 20);
+      const rohkosten = weight_kg * 2;
+      const grundpreis = rohkosten + laufzeit * 0.75 + 60;
+      preis1 = (grundpreis * 1.2).toFixed(2);
+      preis10 = (grundpreis * 1.0).toFixed(2);
+      preis100 = (grundpreis * 0.85).toFixed(2);
+    }
 
     res.json({
-      filename: req.file.originalname,
-      teilname: name,
-      zeichnungsnummer: nummer,
+      teilname,
+      zeichnungsnummer,
       material,
-      maße: maße.length === 3 ? maße.join(' x ') + ' mm' : 'nicht erkannt',
-      gewicht: gewicht > 0 ? gewicht.toFixed(3) + ' kg' : 'k.A.',
-      preis1: preis1.toFixed(2),
-      preis10: preis10.toFixed(2),
-      preis100: preis100.toFixed(2)
+      masse,
+      gewicht,
+      preis1,
+      preis10,
+      preis100
     });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Analysefehler', details: e.message });
+
+  } catch (err) {
+    console.error("Analysefehler:", err);
+    res.status(500).json({ error: "Analysefehler", detail: err.message });
   }
 });
 
-app.listen(PORT, () => console.log('✅ Backend V9 läuft auf Port', PORT));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log("✅ Backend V9 läuft auf Port", PORT));
