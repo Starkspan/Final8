@@ -1,89 +1,52 @@
-
-const express = require("express");
-const multer = require("multer");
-const cors = require("cors");
-const pdf = require("pdf-parse");
-
+const express = require('express');
+const multer = require('multer');
+const vision = require('@google-cloud/vision');
 const app = express();
-app.use(cors());
 const upload = multer({ storage: multer.memoryStorage() });
+const PORT = process.env.PORT || 10000;
 
-app.post("/pdf/analyze", upload.single("file"), async (req, res) => {
+// Google Vision Client
+const client = new vision.ImageAnnotatorClient();
+
+app.use(express.json());
+
+app.post('/analyze', upload.single('file'), async (req, res) => {
   try {
-    const buffer = req.file.buffer;
-    const data = await pdf(buffer);
-    const text = data.text.replace(/\n/g, " ");
-    const extract = (pattern, fallback = null) => {
-      const match = text.match(pattern);
-      return match && match[1] ? match[1].trim() : fallback;
-    };
+    const [result] = await client.documentTextDetection({ image: { content: req.file.buffer } });
+    const text = result.fullTextAnnotation.text;
 
-    // Teilename z. B. "Konturplatte 89x58x12,8"
-    const teilname = extract(/Benennung\s*[:=]?\s*([\w\-\s\.,]+)/i)
-                  || extract(/Konturplatte\s*([\d\sxX\.,]+)/i)
-                  || "k.A.";
+    const material = (text.match(/1\.\d{4}/) || [])[0] || 'k.A.';
+    const nummer = (text.match(/(A\d{6,})/) || [])[0] || 'k.A.';
+    const name = (text.match(/\b[A-Z]{2,}[\w\s\-\/]{5,}/) || [])[0] || 'k.A.';
 
-    // Zeichnungsnummer: 7-stellige oder alphanumerische
-    const zeichnungsnummer = extract(/Zeichnungsnummer\s*[:=]?\s*(\w{6,})/i)
-                          || extract(/(A\d{6,})/i)
-                          || extract(/\b(7\d{6})\b/, "k.A.");
+    const maße = (text.match(/\b(\d{2,4})\s*x\s*(\d{2,4})\s*x\s*(\d{1,4})\b/i) || []).slice(1, 4);
+    const [L, B, H] = maße.map(m => parseFloat(m)).filter(Boolean);
+    const volumen = L && B && H ? (L / 1000) * (B / 1000) * (H / 1000) : 0;
 
-    // Material
-    const materialRaw = extract(/Material\s*[:=]?\s*([\w\.\-\/]+)/i)
-                     || extract(/Werkstoff\s*[:=]?\s*([\w\.\-\/]+)/i)
-                     || extract(/(1\.[0-9]{4})/)
-                     || extract(/(3\.[0-9]{4})/)
-                     || "stahl";
+    const dichte = material === '1.4301' ? 7.9 : material === '1.2024' ? 2.7 : 1.0;
+    const gewicht = volumen * dichte;
 
-    let material = materialRaw.toLowerCase();
-    let dichte = 7.85;
-    if (material.includes("alu") || material.includes("3.4365") || material.includes("almg")) {
-      material = "aluminium"; dichte = 2.7;
-    } else if (material.includes("edelstahl") || material.includes("1.4301")) {
-      material = "edelstahl"; dichte = 7.9;
-    } else if (material.includes("1.2767")) {
-      material = "werkzeugstahl"; dichte = 7.85;
-    }
-
-    // Maße z. B. "89 x 58 x 12,8"
-    let masse = extract(/(\d{2,4})\s?[xX*]\s?(\d{2,4})\s?[xX*]\s?(\d{1,3}[\.,]\d{1,3})/);
-    let form = "k.A.";
-    let gewicht = "k.A.";
-    let preis1 = "-", preis10 = "-", preis100 = "-";
-
-    if (masse) {
-      const match = masse.match(/(\d{2,4})\s?[xX*]\s?(\d{2,4})\s?[xX*]\s?(\d{1,3}[\.,]\d{1,3})/);
-      const [a, b, c] = [parseFloat(match[1]), parseFloat(match[2]), parseFloat(match[3].replace(",", "."))];
-      const volumen_cm3 = (a * b * c); // mm³
-      const gewicht_kg = (volumen_cm3 / 1000) * dichte / 1000; // in kg
-      gewicht = gewicht_kg.toFixed(3) + " kg";
-      form = "Platte";
-
-      const laufzeit = Math.max(1, gewicht_kg * 20 + 5); // grob
-      const rohmaterial = gewicht_kg * 1.5;
-      const kosten = rohmaterial + laufzeit * 0.75 + 30;
-
-      preis1 = (kosten * 1.2).toFixed(2) + " €";
-      preis10 = (kosten * 1.1).toFixed(2) + " €";
-      preis100 = (kosten * 0.9).toFixed(2) + " €";
-    }
+    const laufzeit = gewicht > 0 ? Math.max(5, gewicht * 2) : 0;
+    const materialkosten = gewicht * 2;  // 2 €/kg
+    const preis1 = materialkosten + laufzeit * 1.5 + 60;
+    const preis10 = preis1 * 0.9;
+    const preis100 = preis1 * 0.75;
 
     res.json({
-      teilname,
-      zeichnungsnummer,
+      filename: req.file.originalname,
+      teilname: name,
+      zeichnungsnummer: nummer,
       material,
-      masse: masse || "nicht erkannt",
-      form,
-      gewicht,
-      preis1,
-      preis10,
-      preis100
+      maße: maße.length === 3 ? maße.join(' x ') + ' mm' : 'nicht erkannt',
+      gewicht: gewicht > 0 ? gewicht.toFixed(3) + ' kg' : 'k.A.',
+      preis1: preis1.toFixed(2),
+      preis10: preis10.toFixed(2),
+      preis100: preis100.toFixed(2)
     });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Analysefehler" });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Analysefehler', details: e.message });
   }
 });
 
-app.listen(10000, () => console.log("✅ Backend V6 läuft auf Port 10000"));
+app.listen(PORT, () => console.log('✅ Backend V9 läuft auf Port', PORT));
